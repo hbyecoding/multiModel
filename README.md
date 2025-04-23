@@ -39,11 +39,7 @@ multimodal_youtube_agent/
     └── real_time_eval.py    # 实时评估
 ```
 
-## 技术指标
-- CLIP zero-shot分类准确率提升28%
-- Whisper关键帧对齐准确率95.4%
-- 内容质量评估P99延迟<80ms
-- GPT-4标题生成相关度92.3%
+
 
 ## 依赖环境
 - Python 3.8+
