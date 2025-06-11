@@ -1,0 +1,11 @@
+{
+    "train": [
+        "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+        "https://www.youtube.com/watch?v=9bZkp7q19f0",
+        "https://www.youtube.com/watch?v=kJQP7kiw5Fk"
+    ],
+    "validation": [
+        "https://www.youtube.com/watch?v=JGwWNGJdvx8",
+        "https://www.youtube.com/watch?v=RgKAFK5djSk"
+    ]
+} 
