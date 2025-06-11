@@ -2,6 +2,18 @@ import pandas as pd
 import numpy as np
 from typing import Dict, List, Tuple, Any
 from datetime import datetime
+import os
+import json
+import torch
+import logging
+from pathlib import Path
+from torch.utils.data import Dataset
+from pytube import YouTube
+from PIL import Image
+import requests
+from io import BytesIO
+
+logger = logging.getLogger(__name__)
 
 class DataProcessor:
     def __init__(self):
@@ -125,3 +137,185 @@ class DataProcessor:
         merged_data.set_index('date', inplace=True)
         
         return merged_data
+
+class YouTubeDataset(Dataset):
+    def __init__(self, data_dict):
+        """初始化YouTube数据集
+        
+        Args:
+            data_dict: 包含数据的字典
+        """
+        self.titles = data_dict['titles']
+        self.thumbnails = data_dict['thumbnails']
+        self.audio = data_dict.get('audio', None)
+        self.descriptions = data_dict.get('descriptions', None)
+        
+    def __len__(self):
+        return len(self.titles)
+    
+    def __getitem__(self, idx):
+        item = {
+            'title': self.titles[idx],
+            'thumbnail': self.thumbnails[idx]
+        }
+        
+        if self.audio is not None:
+            item['audio'] = self.audio[idx]
+            
+        if self.descriptions is not None:
+            item['description'] = self.descriptions[idx]
+            
+        return item
+
+class YouTubeDataProcessor:
+    def __init__(self):
+        """初始化YouTube数据处理器"""
+        self.base_path = Path(__file__).parent
+        self.data_path = self.base_path / 'data'
+        self.cache_path = self.data_path / 'cache'
+        
+        # 确保缓存目录存在
+        self.cache_path.mkdir(parents=True, exist_ok=True)
+    
+    def download_video_data(self, video_url: str) -> Dict[str, Any]:
+        """下载YouTube视频数据
+        
+        Args:
+            video_url: YouTube视频URL
+            
+        Returns:
+            video_data: 视频数据字典
+        """
+        try:
+            # 创建YouTube对象
+            yt = YouTube(video_url)
+            
+            # 获取视频信息
+            video_data = {
+                'title': yt.title,
+                'description': yt.description,
+                'thumbnail_url': yt.thumbnail_url,
+                'video_id': yt.video_id
+            }
+            
+            # 下载缩略图
+            response = requests.get(video_data['thumbnail_url'])
+            if response.status_code == 200:
+                thumbnail = Image.open(BytesIO(response.content))
+                thumbnail_path = self.cache_path / f"{video_data['video_id']}_thumbnail.jpg"
+                thumbnail.save(thumbnail_path)
+                video_data['thumbnail_path'] = str(thumbnail_path)
+            
+            # 下载音频
+            audio_stream = yt.streams.filter(only_audio=True).first()
+            audio_path = self.cache_path / f"{video_data['video_id']}_audio.mp3"
+            audio_stream.download(filename=str(audio_path))
+            video_data['audio_path'] = str(audio_path)
+            
+            return video_data
+            
+        except Exception as e:
+            logger.error(f"下载视频数据时出错: {str(e)}")
+            return None
+    
+    def load_data(self) -> Dict[str, List]:
+        """加载数据
+        
+        Returns:
+            data: 数据字典
+        """
+        # 从JSON文件加载视频URL列表
+        video_urls_path = self.data_path / 'video_urls.json'
+        
+        if not video_urls_path.exists():
+            raise FileNotFoundError(f"找不到视频URL文件: {video_urls_path}")
+        
+        with open(video_urls_path, 'r') as f:
+            video_urls = json.load(f)
+        
+        # 下载并处理每个视频的数据
+        all_data = {
+            'titles': [],
+            'descriptions': [],
+            'thumbnails': [],
+            'audio': []
+        }
+        
+        for url in video_urls:
+            video_data = self.download_video_data(url)
+            if video_data:
+                all_data['titles'].append(video_data['title'])
+                all_data['descriptions'].append(video_data['description'])
+                all_data['thumbnails'].append(video_data['thumbnail_path'])
+                all_data['audio'].append(video_data['audio_path'])
+        
+        return all_data
+    
+    def build_datasets(self, 
+                      text_features: torch.Tensor,
+                      image_features: torch.Tensor,
+                      audio_features: torch.Tensor,
+                      val_split: float = 0.2) -> Tuple[Dataset, Dataset]:
+        """构建训练和验证数据集
+        
+        Args:
+            text_features: 文本特征
+            image_features: 图像特征
+            audio_features: 音频特征
+            val_split: 验证集比例
+            
+        Returns:
+            train_dataset: 训练数据集
+            val_dataset: 验证数据集
+        """
+        # 计算分割点
+        total_samples = len(text_features)
+        val_size = int(total_samples * val_split)
+        train_size = total_samples - val_size
+        
+        # 构建数据字典
+        train_data = {
+            'titles': text_features[:train_size],
+            'thumbnails': image_features[:train_size],
+            'audio': audio_features[:train_size]
+        }
+        
+        val_data = {
+            'titles': text_features[train_size:],
+            'thumbnails': image_features[train_size:],
+            'audio': audio_features[train_size:]
+        }
+        
+        # 创建数据集
+        train_dataset = YouTubeDataset(train_data)
+        val_dataset = YouTubeDataset(val_data)
+        
+        return train_dataset, val_dataset
+    
+    def save_features(self, features: Dict[str, torch.Tensor], name: str):
+        """保存特征
+        
+        Args:
+            features: 特征字典
+            name: 特征名称
+        """
+        save_path = self.cache_path / f"{name}_features.pt"
+        torch.save(features, save_path)
+        logger.info(f"特征已保存到: {save_path}")
+    
+    def load_features(self, name: str) -> Dict[str, torch.Tensor]:
+        """加载特征
+        
+        Args:
+            name: 特征名称
+            
+        Returns:
+            features: 特征字典
+        """
+        load_path = self.cache_path / f"{name}_features.pt"
+        if not load_path.exists():
+            raise FileNotFoundError(f"找不到特征文件: {load_path}")
+            
+        features = torch.load(load_path)
+        logger.info(f"已加载特征: {load_path}")
+        return features

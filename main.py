@@ -1,15 +1,20 @@
 import os
-import pandas as pd
-import numpy as np
-import matplotlib.pyplot as plt
-from datetime import datetime
-from pathlib import Path
-from strategy import QuantStrategy
-import yfinance as yf
-import requests
-from bs4 import BeautifulSoup
-import json
+import torch
 import logging
+from pathlib import Path
+from transformers import (
+    LlamaTokenizer, 
+    LlamaForCausalLM,
+    CLIPProcessor, 
+    CLIPModel,
+    TrainingArguments
+)
+from models.clip_trainer import CLIPTrainer
+from models.llama_trainer import LLAMATrainer
+from data_processor import YouTubeDataProcessor
+from feature_extraction.text_processor import TextProcessor
+from feature_extraction.image_processor import ImageProcessor
+from feature_extraction.audio_processor import AudioProcessor
 
 # 设置日志
 logging.basicConfig(
@@ -18,119 +23,165 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-class DataCollector:
+class YouTubeMultiModalTrainer:
     def __init__(self):
-        self.base_path = Path(__file__).parent / 'data'
-        self.market_data_path = self.base_path / 'market_data'
-        self.fundamental_data_path = self.base_path / 'fundamental_data'
-        self.news_data_path = self.base_path / 'news_data'
-        self.social_data_path = self.base_path / 'social_media_data'
+        self.base_path = Path(__file__).parent
+        self.data_path = self.base_path / 'data'
+        self.models_path = self.base_path / 'models'
+        self.output_path = self.base_path / 'training' / 'outputs'
+        
+        # 确保必要的目录存在
+        self.output_path.mkdir(parents=True, exist_ok=True)
+        
+        # 初始化处理器
+        self.data_processor = YouTubeDataProcessor()
+        self.text_processor = TextProcessor()
+        self.image_processor = ImageProcessor()
+        self.audio_processor = AudioProcessor()
+        
+        # 设置设备
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        logger.info(f"使用设备: {self.device}")
 
-    def download_market_data(self, symbols, start_date, end_date):
-        """下载市场数据"""
-        logger.info(f"开始下载市场数据: {symbols}")
-        for symbol in symbols:
-            try:
-                stock = yf.Ticker(symbol)
-                df = stock.history(start=start_date, end=end_date)
-                if not df.empty:
-                    df.to_csv(self.market_data_path / f"{symbol}_market_data.csv")
-                    logger.info(f"成功下载 {symbol} 的市场数据")
-            except Exception as e:
-                logger.error(f"下载 {symbol} 数据时出错: {str(e)}")
+    def setup_clip_model(self):
+        """设置和初始化CLIP模型"""
+        logger.info("初始化CLIP模型...")
+        
+        # 加载CLIP模型和处理器
+        model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32")
+        processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
+        
+        # 初始化训练器
+        self.clip_trainer = CLIPTrainer(
+            model=model,
+            processor=processor,
+            device=self.device
+        )
+        
+        logger.info("CLIP模型设置完成")
 
-    def download_fundamental_data(self, symbols):
-        """下载基本面数据"""
-        logger.info("开始下载基本面数据")
-        for symbol in symbols:
-            try:
-                stock = yf.Ticker(symbol)
-                # 获取财务报表数据
-                financials = stock.financials
-                balance_sheet = stock.balance_sheet
-                cash_flow = stock.cash_flow
-                
-                # 合并财务数据
-                fundamental_data = {
-                    'financials': financials.to_dict(),
-                    'balance_sheet': balance_sheet.to_dict(),
-                    'cash_flow': cash_flow.to_dict()
-                }
-                
-                # 保存数据
-                with open(self.fundamental_data_path / f"{symbol}_fundamental.json", 'w') as f:
-                    json.dump(fundamental_data, f)
-                logger.info(f"成功下载 {symbol} 的基本面数据")
-            except Exception as e:
-                logger.error(f"下载 {symbol} 基本面数据时出错: {str(e)}")
+    def setup_llama_model(self):
+        """设置和初始化LLAMA2模型"""
+        logger.info("初始化LLAMA2模型...")
+        
+        # 加载LLAMA2模型和分词器
+        model = LlamaForCausalLM.from_pretrained(
+            "meta-llama/Llama-2-7b",
+            torch_dtype=torch.float16,
+            device_map="auto"
+        )
+        tokenizer = LlamaTokenizer.from_pretrained("meta-llama/Llama-2-7b")
+        
+        # 初始化训练器
+        self.llama_trainer = LLAMATrainer(
+            model=model,
+            tokenizer=tokenizer,
+            device=self.device
+        )
+        
+        logger.info("LLAMA2模型设置完成")
 
-def plot_performance(results, save_path):
-    """绘制策略表现图表"""
-    plt.figure(figsize=(15, 10))
-    
-    # 绘制累积收益曲线
-    plt.subplot(2, 1, 1)
-    results['cumulative_returns'].plot()
-    plt.title('策略累积收益')
-    plt.grid(True)
-    
-    # 绘制每日收益分布
-    plt.subplot(2, 1, 2)
-    results['daily_returns'].hist(bins=50)
-    plt.title('每日收益分布')
-    plt.grid(True)
-    
-    plt.tight_layout()
-    plt.savefig(save_path)
-    plt.close()
+    def train_clip(self, train_data, val_data, training_args):
+        """训练CLIP模型"""
+        logger.info("开始CLIP模型训练...")
+        
+        # 设置训练参数
+        args = TrainingArguments(
+            output_dir=str(self.output_path / "clip"),
+            num_train_epochs=training_args.get('num_epochs', 3),
+            per_device_train_batch_size=training_args.get('batch_size', 32),
+            learning_rate=training_args.get('learning_rate', 5e-5),
+            logging_dir=str(self.output_path / "clip" / "logs"),
+        )
+        
+        # 开始训练
+        self.clip_trainer.train(
+            train_data=train_data,
+            val_data=val_data,
+            training_args=args
+        )
+        
+        logger.info("CLIP模型训练完成")
 
-def print_performance_metrics(results):
-    """打印策略表现指标"""
-    logger.info('\n策略表现指标:')
-    logger.info(f"年化收益率: {results['annual_return']*100:.2f}%")
-    logger.info(f"夏普比率: {results['sharpe_ratio']:.2f}")
-    logger.info(f"最大回撤: {results['max_drawdown']*100:.2f}%")
+    def train_llama(self, train_data, val_data, training_args):
+        """训练LLAMA2模型"""
+        logger.info("开始LLAMA2模型训练...")
+        
+        # 设置训练参数
+        args = TrainingArguments(
+            output_dir=str(self.output_path / "llama"),
+            num_train_epochs=training_args.get('num_epochs', 3),
+            per_device_train_batch_size=training_args.get('batch_size', 4),
+            learning_rate=training_args.get('learning_rate', 1e-5),
+            logging_dir=str(self.output_path / "llama" / "logs"),
+            fp16=True,  # 使用混合精度训练
+            gradient_accumulation_steps=4
+        )
+        
+        # 开始训练
+        self.llama_trainer.train(
+            train_data=train_data,
+            val_data=val_data,
+            training_args=args
+        )
+        
+        logger.info("LLAMA2模型训练完成")
+
+    def process_youtube_data(self):
+        """处理YouTube数据"""
+        logger.info("开始处理YouTube数据...")
+        
+        # 加载和预处理数据
+        raw_data = self.data_processor.load_data()
+        
+        # 提取特征
+        text_features = self.text_processor.process(raw_data['titles'])
+        image_features = self.image_processor.process(raw_data['thumbnails'])
+        audio_features = self.audio_processor.process(raw_data['audio'])
+        
+        # 构建训练数据集
+        train_data, val_data = self.data_processor.build_datasets(
+            text_features,
+            image_features,
+            audio_features
+        )
+        
+        logger.info("YouTube数据处理完成")
+        return train_data, val_data
 
 def main():
-    # 创建数据收集器
-    collector = DataCollector()
-    
-    # 设置参数
-    symbols = ['AAPL', 'GOOGL', 'MSFT', 'AMZN', 'META']  # 示例股票
-    start_date = '2020-01-01'
-    end_date = datetime.now().strftime('%Y-%m-%d')
-    
-    # 下载数据
-    collector.download_market_data(symbols, start_date, end_date)
-    collector.download_fundamental_data(symbols)
-    
-    # 策略参数
-    params = {
-        'market_data_path': str(collector.market_data_path),
-        'fundamental_data_path': str(collector.fundamental_data_path),
-        'top_n': 3,  # 选股数量
-        'holding_period': 20,  # 持仓周期
-        'initial_capital': 1000000.0  # 初始资金
+    # 训练参数
+    clip_training_args = {
+        'num_epochs': 5,
+        'batch_size': 32,
+        'learning_rate': 5e-5
     }
     
-    # 初始化策略
-    strategy = QuantStrategy()
+    llama_training_args = {
+        'num_epochs': 3,
+        'batch_size': 4,
+        'learning_rate': 1e-5
+    }
     
     try:
-        # 运行策略
-        logger.info('正在运行策略...')
-        results = strategy.run_strategy(**params)
+        # 初始化训练器
+        trainer = YouTubeMultiModalTrainer()
         
-        # 输出策略表现
-        print_performance_metrics(results)
+        # 处理数据
+        train_data, val_data = trainer.process_youtube_data()
         
-        # 绘制策略表现图表
-        plot_path = Path(__file__).parent / 'evaluation' / 'strategy_performance.png'
-        plot_performance(results, plot_path)
-        logger.info(f'\n策略表现图表已保存为 {plot_path}')
+        # 设置并训练CLIP模型
+        trainer.setup_clip_model()
+        trainer.train_clip(train_data, val_data, clip_training_args)
+        
+        # 设置并训练LLAMA2模型
+        trainer.setup_llama_model()
+        trainer.train_llama(train_data, val_data, llama_training_args)
+        
+        logger.info("所有模型训练完成！")
         
     except Exception as e:
-        logger.error(f"策略运行出错: {str(e)}")
+        logger.error(f"训练过程中出错: {str(e)}")
         raise
 
 if __name__ == '__main__':

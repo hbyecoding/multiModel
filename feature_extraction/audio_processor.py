@@ -1,133 +1,161 @@
 import torch
-import whisper
-from typing import Dict, Any
+import logging
+import torchaudio
 import numpy as np
-from pydub import AudioSegment
-import librosa
+from transformers import Wav2Vec2Processor, Wav2Vec2Model
+from typing import List, Union, Dict
+from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 class AudioProcessor:
-    def __init__(self, model_name: str = 'base'):
-        """初始化音频处理器
-        
-        Args:
-            model_name: Whisper模型名称
-        """
-        self.model = whisper.load_model(model_name)
+    def __init__(self):
+        """初始化音频处理器"""
+        self.processor = Wav2Vec2Processor.from_pretrained("facebook/wav2vec2-base-960h")
+        self.model = Wav2Vec2Model.from_pretrained("facebook/wav2vec2-base-960h")
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.model.to(self.device)
+        self.model.eval()
         
-    def transcribe(self, audio_path: str) -> Dict[str, Any]:
-        """音频转录
+        # 设置音频参数
+        self.target_sample_rate = 16000
+        self.max_duration = 30  # 最大处理时长（秒）
+    
+    def load_audio(self, audio_path: Union[str, Path]) -> torch.Tensor:
+        """加载音频文件
         
         Args:
             audio_path: 音频文件路径
             
         Returns:
-            转录结果
-            
-        Raises:
-            FileNotFoundError: 当音频文件不存在时
-            RuntimeError: 当音频文件格式不支持或损坏时
+            waveform: 音频波形
         """
-        import os
-        if not os.path.exists(audio_path):
-            raise FileNotFoundError(f"音频文件不存在: {audio_path}")
-            
         try:
-            # 预处理音频文件
-            audio = AudioSegment.from_file(audio_path)
-            # 转换为WAV格式
-            temp_path = audio_path + ".wav"
-            audio.export(temp_path, format="wav")
-            # 使用转换后的WAV文件进行转录
-            result = self.model.transcribe(temp_path)
-            # 删除临时文件
-            os.remove(temp_path)
-            return result
+            # 加载音频
+            waveform, sample_rate = torchaudio.load(audio_path)
+            
+            # 转换为单声道
+            if waveform.shape[0] > 1:
+                waveform = torch.mean(waveform, dim=0, keepdim=True)
+            
+            # 重采样
+            if sample_rate != self.target_sample_rate:
+                resampler = torchaudio.transforms.Resample(
+                    orig_freq=sample_rate,
+                    new_freq=self.target_sample_rate
+                )
+                waveform = resampler(waveform)
+            
+            return waveform
+            
         except Exception as e:
-            raise RuntimeError(f"音频处理失败: {str(e)}")
-
+            logger.error(f"加载音频时出错 {audio_path}: {str(e)}")
+            return None
     
-    def extract_features(self, audio_path: str) -> np.ndarray:
-        """提取音频特征
+    def process_single_audio(self, waveform: torch.Tensor) -> torch.Tensor:
+        """处理单个音频
         
         Args:
-            audio_path: 音频文件路径
+            waveform: 音频波形
             
         Returns:
-            音频特征数组
+            features: 音频特征张量
         """
-        # 加载音频文件
-        y, sr = librosa.load(audio_path)
+        if waveform is None:
+            return None
         
-        # 提取MFCC特征
-        mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=13)
+        # 截取指定长度
+        max_length = self.target_sample_rate * self.max_duration
+        if waveform.shape[1] > max_length:
+            waveform = waveform[:, :max_length]
         
-        # 提取频谱质心
-        spectral_centroids = librosa.feature.spectral_centroid(y=y, sr=sr)[0]
+        # 预处理音频
+        inputs = self.processor(
+            waveform,
+            sampling_rate=self.target_sample_rate,
+            return_tensors="pt",
+            padding=True
+        ).to(self.device)
         
-        # 提取色谱图特征
-        chroma = librosa.feature.chroma_stft(y=y, sr=sr)
+        # 提取特征
+        with torch.no_grad():
+            outputs = self.model(**inputs)
+            features = torch.mean(outputs.last_hidden_state, dim=1)  # 平均池化
         
-        return np.concatenate([mfcc.flatten(), 
-                              spectral_centroids.flatten(),
-                              chroma.flatten()])
+        return features
     
-    def align_transcription(self, audio_path: str) -> Dict[str, Any]:
-        """对齐音频转录结果
+    def process(self, audio_paths: List[Union[str, Path]]) -> torch.Tensor:
+        """处理音频列表
         
         Args:
-            audio_path: 音频文件路径
+            audio_paths: 音频文件路径列表
             
         Returns:
-            对齐结果
+            features: 音频特征张量
         """
-        # 转录音频
-        result = self.transcribe(audio_path)
+        features = []
         
-        # 提取时间戳信息
-        segments = result['segments']
-        aligned_text = []
+        for path in audio_paths:
+            # 加载音频
+            waveform = self.load_audio(path)
+            if waveform is None:
+                continue
+            
+            # 处理音频
+            feature = self.process_single_audio(waveform)
+            if feature is not None:
+                features.append(feature)
         
-        for segment in segments:
-            aligned_text.append({
-                'text': segment['text'],
-                'start': segment['start'],
-                'end': segment['end'],
-                'confidence': segment['confidence']
-            })
+        if not features:
+            raise ValueError("没有成功处理任何音频")
         
-        return {
-            'aligned_text': aligned_text,
-            'language': result['language'],
-            'duration': result['segments'][-1]['end']
-        }
+        # 堆叠所有特征
+        features = torch.cat(features, dim=0)
+        return features
     
-    def analyze_audio(self, audio_path: str) -> Dict[str, Any]:
-        """分析音频内容
+    def batch_process(self, audio_paths: List[Union[str, Path]], 
+                     batch_size: int = 16) -> torch.Tensor:
+        """批量处理音频
         
         Args:
-            audio_path: 音频文件路径
+            audio_paths: 音频文件路径列表
+            batch_size: 批次大小
             
         Returns:
-            音频分析结果
+            features: 音频特征张量
         """
-        # 提取音频特征
-        features = self.extract_features(audio_path)
+        features = []
         
-        # 获取音频基本信息
-        audio = AudioSegment.from_file(audio_path)
+        for i in range(0, len(audio_paths), batch_size):
+            batch_paths = audio_paths[i:i + batch_size]
+            batch_features = self.process(batch_paths)
+            features.append(batch_features)
         
-        # 计算特征统计量
-        stats = {
-            'feature_mean': np.mean(features),
-            'feature_std': np.std(features),
-            'feature_norm': np.linalg.norm(features)
-        }
+        features = torch.cat(features, dim=0)
+        return features
+    
+    def compute_similarity(self, audio1_path: Union[str, Path],
+                         audio2_path: Union[str, Path]) -> float:
+        """计算两段音频的相似度
         
-        return {
-            'features': features,
-            'stats': stats,
-            'duration': len(audio) / 1000.0,  # 转换为秒
-            'sample_rate': audio.frame_rate,
-            'channels': audio.channels
-        }
+        Args:
+            audio1_path: 第一段音频路径
+            audio2_path: 第二段音频路径
+            
+        Returns:
+            similarity: 相似度分数
+        """
+        # 加载音频
+        waveform1 = self.load_audio(audio1_path)
+        waveform2 = self.load_audio(audio2_path)
+        
+        if waveform1 is None or waveform2 is None:
+            return 0.0
+        
+        # 提取特征
+        feature1 = self.process_single_audio(waveform1)
+        feature2 = self.process_single_audio(waveform2)
+        
+        # 计算余弦相似度
+        similarity = torch.cosine_similarity(feature1, feature2, dim=1)
+        return similarity.item()

@@ -1,86 +1,143 @@
 import torch
-import torch.nn as nn
-from torchvision import transforms
+import logging
 from PIL import Image
-from typing import Dict, Any
-import clip
-import numpy as np
+from torchvision import transforms
+from transformers import ViTFeatureExtractor, ViTModel
+from typing import List, Union, Dict
+from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 class ImageProcessor:
-    def __init__(self, clip_model: str = 'ViT-B/32'):
-        """初始化图像处理器
-        
-        Args:
-            clip_model: CLIP模型名称
-        """
+    def __init__(self):
+        """初始化图像处理器"""
+        self.feature_extractor = ViTFeatureExtractor.from_pretrained('google/vit-base-patch16-224')
+        self.model = ViTModel.from_pretrained('google/vit-base-patch16-224')
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        self.model, self.preprocess = clip.load(clip_model, device=self.device)
+        self.model.to(self.device)
+        self.model.eval()
         
-    def extract_features(self, image_path: str) -> torch.Tensor:
-        """提取图像特征
-        
-        Args:
-            image_path: 图像路径
-            
-        Returns:
-            图像特征张量
-        """
-        image = Image.open(image_path).convert('RGB')
-        image_input = self.preprocess(image).unsqueeze(0).to(self.device)
-        
-        with torch.no_grad():
-            image_features = self.model.encode_image(image_input)
-            
-        return image_features
+        # 设置图像预处理
+        self.transform = transforms.Compose([
+            transforms.Resize((224, 224)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                              std=[0.229, 0.224, 0.225])
+        ])
     
-    def compute_image_text_similarity(self, image_path: str, text: str) -> float:
-        """计算图像和文本的相似度
+    def load_image(self, image_path: Union[str, Path]) -> Image.Image:
+        """加载图像
         
         Args:
             image_path: 图像路径
-            text: 文本内容
             
         Returns:
-            相似度分数
+            image: PIL图像对象
         """
-        image = Image.open(image_path).convert('RGB')
-        image_input = self.preprocess(image).unsqueeze(0).to(self.device)
+        try:
+            image = Image.open(image_path).convert('RGB')
+            return image
+        except Exception as e:
+            logger.error(f"加载图像时出错 {image_path}: {str(e)}")
+            return None
+    
+    def process_single_image(self, image: Image.Image) -> torch.Tensor:
+        """处理单张图像
         
-        text_token = clip.tokenize([text]).to(self.device)
+        Args:
+            image: PIL图像对象
+            
+        Returns:
+            features: 图像特征张量
+        """
+        if image is None:
+            return None
         
+        # 预处理图像
+        inputs = self.feature_extractor(
+            images=image,
+            return_tensors="pt"
+        ).to(self.device)
+        
+        # 提取特征
         with torch.no_grad():
-            image_features = self.model.encode_image(image_input)
-            text_features = self.model.encode_text(text_token)
+            outputs = self.model(**inputs)
+            features = outputs.last_hidden_state[:, 0, :]  # 使用[CLS]标记
+        
+        return features
+    
+    def process(self, image_paths: List[Union[str, Path]]) -> torch.Tensor:
+        """处理图像列表
+        
+        Args:
+            image_paths: 图像路径列表
             
-            similarity = torch.cosine_similarity(image_features, text_features)
+        Returns:
+            features: 图像特征张量
+        """
+        features = []
+        
+        for path in image_paths:
+            # 加载图像
+            image = self.load_image(path)
+            if image is None:
+                continue
+                
+            # 处理图像
+            feature = self.process_single_image(image)
+            if feature is not None:
+                features.append(feature)
+        
+        if not features:
+            raise ValueError("没有成功处理任何图像")
+        
+        # 堆叠所有特征
+        features = torch.cat(features, dim=0)
+        return features
+    
+    def batch_process(self, image_paths: List[Union[str, Path]], 
+                     batch_size: int = 32) -> torch.Tensor:
+        """批量处理图像
+        
+        Args:
+            image_paths: 图像路径列表
+            batch_size: 批次大小
             
+        Returns:
+            features: 图像特征张量
+        """
+        features = []
+        
+        for i in range(0, len(image_paths), batch_size):
+            batch_paths = image_paths[i:i + batch_size]
+            batch_features = self.process(batch_paths)
+            features.append(batch_features)
+        
+        features = torch.cat(features, dim=0)
+        return features
+    
+    def compute_similarity(self, image1_path: Union[str, Path],
+                         image2_path: Union[str, Path]) -> float:
+        """计算两张图像的相似度
+        
+        Args:
+            image1_path: 第一张图像路径
+            image2_path: 第二张图像路径
+            
+        Returns:
+            similarity: 相似度分数
+        """
+        # 加载并处理图像
+        image1 = self.load_image(image1_path)
+        image2 = self.load_image(image2_path)
+        
+        if image1 is None or image2 is None:
+            return 0.0
+        
+        # 提取特征
+        feature1 = self.process_single_image(image1)
+        feature2 = self.process_single_image(image2)
+        
+        # 计算余弦相似度
+        similarity = torch.cosine_similarity(feature1, feature2, dim=1)
         return similarity.item()
-    
-    def analyze_thumbnail(self, image_path: str) -> Dict[str, Any]:
-        """分析视频封面
-        
-        Args:
-            image_path: 封面图像路径
-            
-        Returns:
-            封面分析结果
-        """
-        # 提取图像特征
-        features = self.extract_features(image_path)
-        
-        # 计算特征统计量
-        stats = {
-            'feature_mean': features.mean().item(),
-            'feature_std': features.std().item(),
-            'feature_norm': torch.norm(features).item()
-        }
-        
-        # 加载原始图像获取基本信息
-        image = Image.open(image_path)
-        
-        return {
-            'features': features.cpu().numpy(),
-            'stats': stats,
-            'size': image.size,
-            'mode': image.mode
-        }
